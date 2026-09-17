@@ -6,9 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "faceheatmap"
 version = "0.1.0"
 description = "Gaze-direction heatmaps and face-boundary attention stats for two-person Zoom recordings"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
-    "mediapipe>=0.10",
+    "mediapipe>=0.10.9,<1.0",
     "opencv-python-headless>=4.9",
     "numpy>=1.26",
     "scipy>=1.11",

@@ -59,18 +59,26 @@ and/or `--flip-pitch` to correct it.
 
 ## Setup
 
+Requires Python 3.9-3.12.
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 scripts/download_models.sh   # downloads MediaPipe's face_landmarker.task (~4MB)
 ```
 
-`mediapipe`'s Tasks API requires a GPU/EGL-capable OpenGL stack even when
-running on CPU. On a minimal Linux install you may need:
+`mediapipe` is pinned to `<1.0` because MediaPipe dropped Python 3.9 wheels
+starting at 1.0.0; the 0.10.x series still has the full Tasks API
+(`FaceLandmarker`) this project uses, so nothing is lost by staying on it.
+
+On Linux, `mediapipe`'s Tasks API requires a GPU/EGL-capable OpenGL stack
+even when running on CPU. On a minimal install you may need:
 
 ```bash
 apt-get install -y libegl1 libgl1 libgles2
 ```
+
+(Not needed on macOS or Windows.)
 
 ## Usage
 
