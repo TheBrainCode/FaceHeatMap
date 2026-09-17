@@ -113,6 +113,7 @@ class FaceHeatmapPipeline:
         boundary_stats = {PersonId.PERSON_1: BoundaryStats(), PersonId.PERSON_2: BoundaryStats()}
 
         background_frame: np.ndarray | None = None
+        first_frame_seen: np.ndarray | None = None
         csv_rows: list[dict] = []
         csv_fieldnames = [
             "frame_index", "timestamp_ms",
@@ -132,12 +133,18 @@ class FaceHeatmapPipeline:
         try:
             for detected in loop:
                 processed += 1
-                if background_frame is None:
-                    background_frame = detected.frame.copy()
+
+                if first_frame_seen is None:
+                    first_frame_seen = detected.frame.copy()
 
                 person_obs = detected.person_obs
                 if len(person_obs) == 2:
                     frames_with_both += 1
+                    if background_frame is None:
+                        # Prefer a frame that actually shows both people over
+                        # frame 0, which can be a black/blank leading frame
+                        # (e.g. a brief intro before the call video starts).
+                        background_frame = detected.frame.copy()
 
                 frame_gaze: dict[PersonId, GazeResult] = {}
                 for person, obs in person_obs.items():
@@ -183,6 +190,9 @@ class FaceHeatmapPipeline:
                 "Never detected two faces in the same frame; cannot establish a "
                 "screen layout. Check that the video actually shows both participants."
             )
+
+        if background_frame is None:
+            background_frame = first_frame_seen
 
         heatmap_paths = self._render_outputs(background_frame, heatmaps)
         summary_path = self._write_summary(processed, frames_with_both, boundary_stats, heatmap_paths)
