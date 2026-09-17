@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from faceheatmap.config import PersonId, PipelineConfig, LayoutMode
+from faceheatmap.debug_draw import draw_debug_overlay
 from faceheatmap.detection_loop import Landmarker, TwoPersonDetectionLoop
 from faceheatmap.face_boundary import BoundaryStats, build_face_polygon, point_in_polygon
 from faceheatmap.gaze import GazeCalibration, GazeResult, SmoothedGazeEstimator
@@ -141,7 +142,8 @@ class FaceHeatmapPipeline:
                     csv_rows.append(row)
 
                 if debug_writer is not None:
-                    debug_writer.write(self._draw_debug_frame(detected.frame, person_obs, frame_gaze, loop.panels))
+                    gaze_points = {p: (g.frame_x, g.frame_y) for p, g in frame_gaze.items() if g.valid}
+                    debug_writer.write(draw_debug_overlay(detected.frame, person_obs, loop.panels, gaze_points))
         finally:
             if debug_writer is not None:
                 debug_writer.release()
@@ -170,23 +172,6 @@ class FaceHeatmapPipeline:
             summary_json_path=summary_path,
             csv_path=csv_path,
         )
-
-    def _draw_debug_frame(self, frame: np.ndarray, person_obs: dict, frame_gaze: dict, panels: dict[PersonId, BBox] | None) -> np.ndarray:
-        out = frame.copy()
-        colors = {PersonId.PERSON_1: (255, 100, 0), PersonId.PERSON_2: (0, 165, 255)}
-        for person, obs in person_obs.items():
-            color = colors[person]
-            polygon = build_face_polygon(obs.landmarks_px).astype(int)
-            cv2.polylines(out, [polygon], isClosed=True, color=color, thickness=2)
-        for person, gaze_result in frame_gaze.items():
-            if not gaze_result.valid:
-                continue
-            color = colors[person]
-            pt = (int(gaze_result.frame_x), int(gaze_result.frame_y))
-            cv2.drawMarker(out, pt, color, markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
-        for panel in (panels or {}).values():
-            cv2.rectangle(out, (int(panel.x0), int(panel.y0)), (int(panel.x1) - 1, int(panel.y1) - 1), (255, 255, 255), 1)
-        return out
 
     def _render_outputs(self, background: np.ndarray | None, heatmaps: dict[PersonId, HeatmapAccumulator]) -> dict[str, dict[str, str]]:
         paths: dict[str, dict[str, str]] = {}

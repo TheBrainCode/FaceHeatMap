@@ -212,3 +212,62 @@ def test_run_calibration_end_to_end_writes_usable_calibration(tmp_path):
     raw_right = RawGazeSignal(head_yaw_deg=0.0, head_pitch_deg=0.0, eye_h=1.0, eye_v=0.0)
     norm_x, _ = calibration[PersonId.PERSON_1].apply(raw_right)
     assert norm_x > 0
+
+
+class NeverTwoFacesLandmarker:
+    def detect(self, frame_bgr, timestamp_ms):
+        return []
+
+
+def test_collect_calibration_samples_raises_clear_error_when_layout_never_established(tmp_path):
+    video_path = str(tmp_path / "calib.mp4")
+    _write_blank_video(video_path, num_frames=10)
+
+    with pytest.raises(RuntimeError, match="Never detected both faces together"):
+        collect_calibration_samples(video_path, NeverTwoFacesLandmarker())
+
+
+def test_run_calibration_reports_missing_points_by_name(tmp_path):
+    # Video only covers the first 2 of 9 points (1s each at 10fps = 20 frames).
+    fps = 10.0
+    seconds_per_point = 1.0
+    video_path = str(tmp_path / "calib.mp4")
+    _write_blank_video(video_path, num_frames=20, fps=fps)
+
+    landmarker = ScriptedCalibrationLandmarker(fps, seconds_per_point)
+    config = CalibrationConfig(seconds_per_point=seconds_per_point, trim_start_frac=0.2, trim_end_frac=0.1)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run_calibration(video_path, landmarker, config, layout=LayoutMode.SIDE_BY_SIDE)
+
+    message = str(excinfo.value)
+    assert "top-right" in message  # one of the never-reached points
+    assert "center" not in message.split("Missing:")[1]  # center *was* captured, shouldn't be listed as missing
+
+
+def test_collect_calibration_samples_writes_debug_video_even_on_failure(tmp_path):
+    video_path = str(tmp_path / "calib.mp4")
+    _write_blank_video(video_path, num_frames=10)
+    debug_path = str(tmp_path / "debug.mp4")
+
+    with pytest.raises(RuntimeError):
+        collect_calibration_samples(video_path, NeverTwoFacesLandmarker(), debug_video_path=debug_path)
+
+    assert os.path.exists(debug_path)
+    assert os.path.getsize(debug_path) > 0
+
+
+def test_collect_calibration_samples_debug_video_on_success(tmp_path):
+    fps = 10.0
+    seconds_per_point = 1.0
+    num_frames = int(len(CALIBRATION_POINTS) * seconds_per_point * fps)
+    video_path = str(tmp_path / "calib.mp4")
+    _write_blank_video(video_path, num_frames, fps=fps)
+    debug_path = str(tmp_path / "debug.mp4")
+
+    landmarker = ScriptedCalibrationLandmarker(fps, seconds_per_point)
+    config = CalibrationConfig(seconds_per_point=seconds_per_point, trim_start_frac=0.2, trim_end_frac=0.1)
+    collect_calibration_samples(video_path, landmarker, config, layout=LayoutMode.SIDE_BY_SIDE, debug_video_path=debug_path)
+
+    assert os.path.exists(debug_path)
+    assert os.path.getsize(debug_path) > 0

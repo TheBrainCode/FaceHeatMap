@@ -76,6 +76,19 @@ Fit the calibration:
 faceheatmap-calibrate calibration_recording.mp4 -o calibration.json
 ```
 
+If it fails (most commonly "never detected both faces together" or "only
+captured N/9 points"), re-run with `--debug-video` to see exactly what was
+detected frame by frame — which calibration point was considered active,
+whether that frame counted or was trimmed, and how many faces were tracked:
+
+```bash
+faceheatmap-calibrate calibration_recording.mp4 -o calibration.json --debug-video
+```
+
+(writes `calibration_debug.mp4` by default; pass a path to change that). A
+debug video is written even when calibration ultimately fails, so you can
+always inspect what happened.
+
 Then use it for the real call recording:
 
 ```bash

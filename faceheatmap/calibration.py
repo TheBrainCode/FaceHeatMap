@@ -26,6 +26,7 @@ import json
 import sys
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 
 from faceheatmap.config import LayoutMode, PersonId
@@ -113,35 +114,70 @@ def collect_calibration_samples(
     calib_config: CalibrationConfig | None = None,
     layout: LayoutMode = LayoutMode.AUTO,
     frame_stride: int = 1,
+    debug_video_path: str | None = None,
 ) -> dict[PersonId, list[CalibrationSample]]:
     """Runs the calibration video through detection/tracking and buckets each
     frame's raw signal into the calibration point active at that timestamp.
+
+    Raises immediately if the two faces are never detected together at all
+    (most common cause of an empty result), rather than silently returning
+    nothing and leaving the caller to guess why.
     """
     calib_config = calib_config or CalibrationConfig()
     loop = TwoPersonDetectionLoop(video_path, landmarker, layout=layout, frame_stride=frame_stride)
 
+    # Pre-populated so a point that's never reached (e.g. a too-short
+    # recording) is distinguishable from one that just had 0 counted frames.
     raw_by_person_point: dict[PersonId, dict[int, list[RawGazeSignal]]] = {
-        PersonId.PERSON_1: {},
-        PersonId.PERSON_2: {},
+        PersonId.PERSON_1: {i: [] for i in range(len(CALIBRATION_POINTS))},
+        PersonId.PERSON_2: {i: [] for i in range(len(CALIBRATION_POINTS))},
     }
 
-    for detected in loop:
-        t_s = detected.timestamp_ms / 1000.0
-        point_index = int(t_s // calib_config.seconds_per_point)
-        if point_index >= len(CALIBRATION_POINTS):
-            continue
+    debug_writer = None
+    try:
+        for detected in loop:
+            t_s = detected.timestamp_ms / 1000.0
+            point_index = int(t_s // calib_config.seconds_per_point)
+            in_range = point_index < len(CALIBRATION_POINTS)
 
-        progress = (t_s % calib_config.seconds_per_point) / calib_config.seconds_per_point
-        if progress < calib_config.trim_start_frac or progress > (1.0 - calib_config.trim_end_frac):
-            continue
+            counted = False
+            point_name = "(sequence finished)"
+            if in_range:
+                point_name = CALIBRATION_POINTS[point_index][0]
+                progress = (t_s % calib_config.seconds_per_point) / calib_config.seconds_per_point
+                counted = calib_config.trim_start_frac <= progress <= (1.0 - calib_config.trim_end_frac)
+                if counted:
+                    for person, obs in detected.person_obs.items():
+                        raw = compute_raw_signal(obs.landmarks_px, obs.transform_matrix)
+                        raw_by_person_point[person][point_index].append(raw)
 
-        for person, obs in detected.person_obs.items():
-            raw = compute_raw_signal(obs.landmarks_px, obs.transform_matrix)
-            raw_by_person_point[person].setdefault(point_index, []).append(raw)
+            if debug_video_path is not None:
+                if debug_writer is None:
+                    from faceheatmap.debug_draw import draw_debug_overlay
+
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    debug_writer = cv2.VideoWriter(debug_video_path, fourcc, loop.fps / max(frame_stride, 1), (loop.frame_w, loop.frame_h))
+                status = "counted" if counted else ("trimmed" if in_range else "n/a")
+                n_faces = len(detected.person_obs)
+                label = f"point={point_name} status={status} faces_tracked={n_faces}"
+                debug_writer.write(draw_debug_overlay(detected.frame, detected.person_obs, loop.panels, top_label=label))
+    finally:
+        if debug_writer is not None:
+            debug_writer.release()
+
+    if loop.panels is None:
+        raise RuntimeError(
+            "Never detected both faces together in this recording, so no calibration "
+            "points could be captured at all. Check that the video actually shows two "
+            "people simultaneously (e.g. it isn't speaker-view / one person at a time), "
+            "and try re-running with --debug-video to see what was detected frame by frame."
+        )
 
     samples: dict[PersonId, list[CalibrationSample]] = {PersonId.PERSON_1: [], PersonId.PERSON_2: []}
     for person, by_point in raw_by_person_point.items():
         for point_index, raws in sorted(by_point.items()):
+            if not raws:
+                continue
             name, target_x, target_y = CALIBRATION_POINTS[point_index]
             averaged = RawGazeSignal(
                 head_yaw_deg=float(np.mean([r.head_yaw_deg for r in raws])),
@@ -160,16 +196,22 @@ def run_calibration(
     calib_config: CalibrationConfig | None = None,
     layout: LayoutMode = LayoutMode.AUTO,
     frame_stride: int = 1,
+    debug_video_path: str | None = None,
 ) -> dict[PersonId, PersonCalibration]:
-    samples = collect_calibration_samples(video_path, landmarker, calib_config, layout, frame_stride)
+    samples = collect_calibration_samples(video_path, landmarker, calib_config, layout, frame_stride, debug_video_path)
 
     result: dict[PersonId, PersonCalibration] = {}
     for person, person_samples in samples.items():
         if len(person_samples) < 3:
+            captured_names = {s.point_name for s in person_samples}
+            missing = [name for name, _, _ in CALIBRATION_POINTS if name not in captured_names]
             raise RuntimeError(
-                f"Only captured {len(person_samples)} calibration point(s) for {person.value}; "
-                f"need at least 3. Check the recording covers the full "
-                f"{len(CALIBRATION_POINTS)}-point sequence with both faces visible throughout."
+                f"Only captured {len(person_samples)}/{len(CALIBRATION_POINTS)} calibration point(s) "
+                f"for {person.value}; need at least 3. Missing: {', '.join(missing)}. This usually means "
+                f"the recording is shorter than {len(CALIBRATION_POINTS)} x --seconds-per-point "
+                f"({calib_config.seconds_per_point if calib_config else 2.0}s each), the person's face "
+                f"dropped out of detection during those points, or --seconds-per-point doesn't match how "
+                f"the video was actually recorded. Re-run with --debug-video to see frame by frame."
             )
         result[person] = fit_person_calibration(person_samples)
     return result
@@ -198,6 +240,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--layout", choices=[m.value for m in LayoutMode], default=LayoutMode.AUTO.value)
     parser.add_argument("--seconds-per-point", type=float, default=2.0, help="How long each point was held for while recording")
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument(
+        "--debug-video",
+        nargs="?",
+        const="calibration_debug.mp4",
+        default=None,
+        metavar="PATH",
+        help="Write an annotated debug video (face boundaries, active point, counted/trimmed status) to diagnose detection issues. Defaults to calibration_debug.mp4 if no path given.",
+    )
     args = parser.parse_args(argv)
 
     from faceheatmap.landmarker import FaceLandmarkerWrapper
@@ -210,12 +260,19 @@ def main(argv: list[str] | None = None) -> int:
             CalibrationConfig(seconds_per_point=args.seconds_per_point),
             layout=LayoutMode(args.layout),
             frame_stride=args.frame_stride,
+            debug_video_path=args.debug_video,
         )
+    except RuntimeError:
+        if args.debug_video:
+            print(f"Calibration failed -- see {args.debug_video} for what was detected frame by frame.", file=sys.stderr)
+        raise
     finally:
         landmarker.close()
 
     save_calibration(calibration, args.output)
     print(f"Calibration written to {args.output}")
+    if args.debug_video:
+        print(f"Debug video written to {args.debug_video}")
     for person, cal in calibration.items():
         print(f"  {person.value}: h_weights={tuple(round(w, 4) for w in cal.h_weights)} v_weights={tuple(round(w, 4) for w in cal.v_weights)}")
     return 0
