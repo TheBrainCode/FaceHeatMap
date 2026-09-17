@@ -111,6 +111,20 @@ Useful flags (see `faceheatmap --help` for the full list):
 - `--debug-video` — write an annotated video for visually sanity-checking
   the detections and gaze mapping on your footage.
 
+### Viewing the results
+
+The PNGs in `output/` are already viewable images — open them directly
+(`open output/person1_gaze_on_person2_panel.png` on macOS, or just browse
+to the folder in Finder/Explorer).
+
+For a combined view, generate an HTML report that embeds all four
+heatmaps, the summary stats, and a gaze-over-time chart on one page:
+
+```bash
+faceheatmap-report output/
+open output/report.html
+```
+
 ## Development
 
 ```bash

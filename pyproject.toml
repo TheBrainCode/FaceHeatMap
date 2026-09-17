@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 faceheatmap = "faceheatmap.cli:main"
+faceheatmap-report = "faceheatmap.report:main"
 
 [tool.setuptools.packages.find]
 include = ["faceheatmap*"]
