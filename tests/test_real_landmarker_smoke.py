@@ -1,0 +1,54 @@
+"""Smoke test against the real MediaPipe model, using a synthetic two-panel
+frame built from a real face photo (tests/fixtures/portrait.jpg, a public
+MediaPipe sample asset). Skipped if the model bundle hasn't been downloaded.
+"""
+import os
+
+import cv2
+import numpy as np
+import pytest
+
+from faceheatmap.config import PipelineConfig
+from faceheatmap.pipeline import FaceHeatmapPipeline
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "face_landmarker.task")
+FIXTURE_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "portrait.jpg")
+
+requires_model = pytest.mark.skipif(
+    not os.path.exists(MODEL_PATH),
+    reason="face_landmarker.task not present; run scripts/download_models.sh first",
+)
+
+
+def _build_two_panel_video(path: str, num_frames: int = 5) -> None:
+    face = cv2.imread(FIXTURE_PATH)
+    assert face is not None, f"missing test fixture at {FIXTURE_PATH}"
+    face = cv2.resize(face, (400, 500))
+
+    frame = np.zeros((500, 800, 3), dtype=np.uint8)
+    frame[:, :400] = face
+    frame[:, 400:] = face
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(path, fourcc, 10.0, (800, 500))
+    for _ in range(num_frames):
+        writer.write(frame)
+    writer.release()
+
+
+@requires_model
+def test_real_model_detects_both_faces_and_produces_outputs(tmp_path):
+    video_path = str(tmp_path / "two_panel.mp4")
+    _build_two_panel_video(video_path)
+
+    out_dir = str(tmp_path / "out")
+    config = PipelineConfig(model_path=MODEL_PATH)
+    result = FaceHeatmapPipeline(video_path, out_dir, config).run()
+
+    assert result.frames_processed == 5
+    assert result.frames_with_both_faces == 5
+
+    for person, paths in result.heatmap_paths.items():
+        assert "full_frame" in paths
+        img = cv2.imread(paths["full_frame"])
+        assert img is not None and img.shape == (500, 800, 3)
