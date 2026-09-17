@@ -4,23 +4,17 @@ from __future__ import annotations
 import csv
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Protocol
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 from faceheatmap.config import PersonId, PipelineConfig, LayoutMode
+from faceheatmap.detection_loop import Landmarker, TwoPersonDetectionLoop
 from faceheatmap.face_boundary import BoundaryStats, build_face_polygon, point_in_polygon
-from faceheatmap.gaze import GazeResult, SmoothedGazeEstimator
+from faceheatmap.gaze import GazeCalibration, GazeResult, SmoothedGazeEstimator
 from faceheatmap.heatmap import HeatmapAccumulator, overlay_on_image
-from faceheatmap.landmarker import FaceObservation
-from faceheatmap.layout import BBox, get_panels, infer_layout_from_bboxes
-from faceheatmap.tracker import IdentityTracker
-
-
-class Landmarker(Protocol):
-    def detect(self, frame_bgr: np.ndarray, timestamp_ms: int) -> list[FaceObservation]: ...
+from faceheatmap.layout import BBox
 
 
 @dataclass
@@ -48,31 +42,43 @@ def _make_landmarker(config: PipelineConfig) -> Landmarker:
 
 
 class FaceHeatmapPipeline:
-    def __init__(self, video_path: str, output_dir: str, config: PipelineConfig | None = None, landmarker: Landmarker | None = None):
+    def __init__(
+        self,
+        video_path: str,
+        output_dir: str,
+        config: PipelineConfig | None = None,
+        landmarker: Landmarker | None = None,
+        calibration: dict[PersonId, GazeCalibration] | None = None,
+    ):
         self.video_path = video_path
         self.output_dir = output_dir
         self.config = config or PipelineConfig()
         self._external_landmarker = landmarker
+        self._calibration = calibration or {}
         self._panels: dict[PersonId, BBox] | None = None
         self._layout_used = self.config.layout
 
     def run(self) -> PipelineResult:
         os.makedirs(self.output_dir, exist_ok=True)
 
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
+        if not cv2.VideoCapture(self.video_path).isOpened():
             raise FileNotFoundError(f"Could not open video: {self.video_path}")
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         landmarker = self._external_landmarker or _make_landmarker(self.config)
         owns_landmarker = self._external_landmarker is None
 
+        loop = TwoPersonDetectionLoop(
+            self.video_path,
+            landmarker,
+            layout=self.config.layout,
+            frame_stride=self.config.frame_stride,
+            max_frames=self.config.max_frames,
+        )
+        frame_w, frame_h = loop.frame_w, loop.frame_h
+
         gaze_estimators = {
-            PersonId.PERSON_1: SmoothedGazeEstimator(self.config.gaze),
-            PersonId.PERSON_2: SmoothedGazeEstimator(self.config.gaze),
+            PersonId.PERSON_1: SmoothedGazeEstimator(self.config.gaze, self._calibration.get(PersonId.PERSON_1)),
+            PersonId.PERSON_2: SmoothedGazeEstimator(self.config.gaze, self._calibration.get(PersonId.PERSON_2)),
         }
         heatmaps = {
             PersonId.PERSON_1: HeatmapAccumulator(frame_w, frame_h, self.config.heatmap),
@@ -80,7 +86,6 @@ class FaceHeatmapPipeline:
         }
         boundary_stats = {PersonId.PERSON_1: BoundaryStats(), PersonId.PERSON_2: BoundaryStats()}
 
-        tracker: IdentityTracker | None = None
         background_frame: np.ndarray | None = None
         csv_rows: list[dict] = []
         csv_fieldnames = [
@@ -93,46 +98,18 @@ class FaceHeatmapPipeline:
         if self.config.write_debug_video:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             debug_path = os.path.join(self.output_dir, "debug_annotated.mp4")
-            debug_writer = cv2.VideoWriter(debug_path, fourcc, fps / max(self.config.frame_stride, 1), (frame_w, frame_h))
+            debug_writer = cv2.VideoWriter(debug_path, fourcc, loop.fps / max(self.config.frame_stride, 1), (frame_w, frame_h))
 
-        frame_idx = 0
         processed = 0
         frames_with_both = 0
 
         try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                if frame_idx % self.config.frame_stride != 0:
-                    frame_idx += 1
-                    continue
-                if self.config.max_frames is not None and processed >= self.config.max_frames:
-                    break
-
+            for detected in loop:
+                processed += 1
                 if background_frame is None:
-                    background_frame = frame.copy()
+                    background_frame = detected.frame.copy()
 
-                timestamp_ms = int(frame_idx * 1000 / fps)
-                observations = landmarker.detect(frame, timestamp_ms)
-
-                if self._panels is None:
-                    if len(observations) < 2:
-                        frame_idx += 1
-                        processed += 1
-                        continue
-                    layout = self.config.layout
-                    if layout is LayoutMode.AUTO:
-                        layout = infer_layout_from_bboxes(observations[0].bbox, observations[1].bbox)
-                    self._layout_used = layout
-                    self._panels = get_panels(frame_w, frame_h, layout)
-                    tracker = IdentityTracker(self._panels)
-
-                assignment = tracker.assign([o.bbox for o in observations])
-                bbox_to_obs = {o.bbox: o for o in observations}
-                person_obs = {person: bbox_to_obs[bbox] for person, bbox in assignment.items()}
-
+                person_obs = detected.person_obs
                 if len(person_obs) == 2:
                     frames_with_both += 1
 
@@ -152,7 +129,7 @@ class FaceHeatmapPipeline:
                         boundary_stats[person].record(inside)
 
                 if self.config.write_csv_log:
-                    row = {"frame_index": frame_idx, "timestamp_ms": timestamp_ms}
+                    row = {"frame_index": detected.frame_index, "timestamp_ms": detected.timestamp_ms}
                     for person in (PersonId.PERSON_1, PersonId.PERSON_2):
                         g = frame_gaze.get(person)
                         prefix = person.value
@@ -164,17 +141,15 @@ class FaceHeatmapPipeline:
                     csv_rows.append(row)
 
                 if debug_writer is not None:
-                    debug_writer.write(self._draw_debug_frame(frame, person_obs, frame_gaze))
-
-                frame_idx += 1
-                processed += 1
+                    debug_writer.write(self._draw_debug_frame(detected.frame, person_obs, frame_gaze, loop.panels))
         finally:
-            cap.release()
             if debug_writer is not None:
                 debug_writer.release()
             if owns_landmarker and hasattr(landmarker, "close"):
                 landmarker.close()
 
+        self._panels = loop.panels
+        self._layout_used = loop.layout_used or self.config.layout
         if self._panels is None:
             raise RuntimeError(
                 "Never detected two faces in the same frame; cannot establish a "
@@ -196,7 +171,7 @@ class FaceHeatmapPipeline:
             csv_path=csv_path,
         )
 
-    def _draw_debug_frame(self, frame: np.ndarray, person_obs: dict, frame_gaze: dict) -> np.ndarray:
+    def _draw_debug_frame(self, frame: np.ndarray, person_obs: dict, frame_gaze: dict, panels: dict[PersonId, BBox] | None) -> np.ndarray:
         out = frame.copy()
         colors = {PersonId.PERSON_1: (255, 100, 0), PersonId.PERSON_2: (0, 165, 255)}
         for person, obs in person_obs.items():
@@ -209,7 +184,7 @@ class FaceHeatmapPipeline:
             color = colors[person]
             pt = (int(gaze_result.frame_x), int(gaze_result.frame_y))
             cv2.drawMarker(out, pt, color, markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
-        for panel in (self._panels or {}).values():
+        for panel in (panels or {}).values():
             cv2.rectangle(out, (int(panel.x0), int(panel.y0)), (int(panel.x1) - 1, int(panel.y1) - 1), (255, 255, 255), 1)
         return out
 

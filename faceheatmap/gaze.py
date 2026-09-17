@@ -22,6 +22,7 @@ face"), not a precise gaze-tracking replacement.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 
@@ -32,6 +33,31 @@ from faceheatmap.landmark_indices import (
     get_landmark_indices,
 )
 from faceheatmap.rotation import matrix_to_euler
+
+
+@dataclass
+class RawGazeSignal:
+    """Uninterpreted per-frame signal: head pose plus within-eye iris offset.
+
+    No FOV assumption, gain, or sign convention baked in yet -- this is
+    exactly the feature vector `faceheatmap.calibration` fits a per-person
+    mapping against.
+    """
+
+    head_yaw_deg: float
+    head_pitch_deg: float
+    eye_h: float  # -1..1, iris offset within the eye box, horizontal
+    eye_v: float  # -1..1, iris offset within the eye box, vertical
+
+
+class GazeCalibration(Protocol):
+    """Structural type for a fitted per-person calibration (see calibration.py).
+
+    Kept as a Protocol here rather than importing `PersonCalibration`
+    directly, so this module doesn't depend on the calibration module.
+    """
+
+    def apply(self, raw: RawGazeSignal) -> tuple[float, float]: ...
 
 
 @dataclass
@@ -58,14 +84,8 @@ def _eye_offset_ratio(landmarks_px: np.ndarray, eye_indices: list[int], iris_cen
     return float(h_ratio), float(v_ratio)
 
 
-def estimate_gaze(
-    landmarks_px: np.ndarray,
-    transform_matrix: np.ndarray,
-    frame_w: int,
-    frame_h: int,
-    config: GazeConfig,
-) -> GazeResult:
-    """Estimates where on the recording frame a face is looking.
+def compute_raw_signal(landmarks_px: np.ndarray, transform_matrix: np.ndarray) -> RawGazeSignal:
+    """Extracts the uninterpreted head-pose + iris-offset signal for a face.
 
     `landmarks_px` must be the 478 FaceLandmarker landmarks in pixel
     coordinates (x, y[, z]) for the full frame. `transform_matrix` is the
@@ -76,11 +96,36 @@ def estimate_gaze(
 
     left_h, left_v = _eye_offset_ratio(landmarks_px, indices["left_eye"], LEFT_IRIS_CENTER)
     right_h, right_v = _eye_offset_ratio(landmarks_px, indices["right_eye"], RIGHT_IRIS_CENTER)
-    eye_h = (left_h + right_h) / 2
-    eye_v = (left_v + right_v) / 2
 
-    yaw = angles.yaw_deg + config.eye_gain_h_deg * eye_h
-    pitch = angles.pitch_deg + config.eye_gain_v_deg * eye_v
+    return RawGazeSignal(
+        head_yaw_deg=angles.yaw_deg,
+        head_pitch_deg=angles.pitch_deg,
+        eye_h=(left_h + right_h) / 2,
+        eye_v=(left_v + right_v) / 2,
+    )
+
+
+def estimate_gaze(
+    landmarks_px: np.ndarray,
+    transform_matrix: np.ndarray,
+    frame_w: int,
+    frame_h: int,
+    config: GazeConfig,
+    calibration: GazeCalibration | None = None,
+) -> GazeResult:
+    """Estimates where on the recording frame a face is looking.
+
+    Without `calibration`, this is the documented FOV heuristic described
+    at the top of this module. With a fitted `GazeCalibration` (see
+    `faceheatmap.calibration`), the normalized screen point instead comes
+    from that person's fitted mapping -- `yaw_deg`/`pitch_deg` and the
+    validity check are still reported from the heuristic angle, since
+    calibration doesn't change what counts as "turned away".
+    """
+    raw = compute_raw_signal(landmarks_px, transform_matrix)
+
+    yaw = raw.head_yaw_deg + config.eye_gain_h_deg * raw.eye_h
+    pitch = raw.head_pitch_deg + config.eye_gain_v_deg * raw.eye_v
 
     if config.flip_yaw:
         yaw = -yaw
@@ -89,8 +134,13 @@ def estimate_gaze(
 
     valid = abs(yaw) <= config.max_valid_yaw_deg and abs(pitch) <= config.max_valid_pitch_deg
 
-    norm_x = float(np.clip(yaw / (config.fov_h_deg / 2), -1.0, 1.0))
-    norm_y = float(np.clip(pitch / (config.fov_v_deg / 2), -1.0, 1.0))
+    if calibration is not None:
+        norm_x, norm_y = calibration.apply(raw)
+        norm_x = float(np.clip(norm_x, -1.0, 1.0))
+        norm_y = float(np.clip(norm_y, -1.0, 1.0))
+    else:
+        norm_x = float(np.clip(yaw / (config.fov_h_deg / 2), -1.0, 1.0))
+        norm_y = float(np.clip(pitch / (config.fov_v_deg / 2), -1.0, 1.0))
 
     frame_x = (norm_x + 1.0) / 2.0 * frame_w
     frame_y = (norm_y + 1.0) / 2.0 * frame_h
@@ -113,12 +163,13 @@ class SmoothedGazeEstimator:
     into the heatmap.
     """
 
-    def __init__(self, config: GazeConfig):
+    def __init__(self, config: GazeConfig, calibration: GazeCalibration | None = None):
         self._config = config
+        self._calibration = calibration
         self._prev_point: tuple[float, float] | None = None
 
     def update(self, landmarks_px: np.ndarray, transform_matrix: np.ndarray, frame_w: int, frame_h: int) -> GazeResult:
-        result = estimate_gaze(landmarks_px, transform_matrix, frame_w, frame_h, self._config)
+        result = estimate_gaze(landmarks_px, transform_matrix, frame_w, frame_h, self._config, self._calibration)
 
         alpha = self._config.smoothing_alpha
         if self._prev_point is None or alpha <= 0:

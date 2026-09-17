@@ -43,6 +43,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-video", action="store_true", help="Also write an annotated debug video with face boundaries and gaze markers")
     parser.add_argument("--no-csv", action="store_true", help="Skip writing the per-frame gaze_log.csv")
 
+    parser.add_argument(
+        "--calibration",
+        default=None,
+        help="Path to a calibration.json from faceheatmap-calibrate; replaces the FOV heuristic with a fitted per-person mapping",
+    )
+
     return parser
 
 
@@ -76,7 +82,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = config_from_args(args)
 
-    pipeline = FaceHeatmapPipeline(args.video, args.output_dir, config)
+    calibration = None
+    if args.calibration:
+        from faceheatmap.calibration import load_calibration
+
+        calibration = load_calibration(args.calibration)
+        print(f"Using calibration from {args.calibration} for: {', '.join(p.value for p in calibration)}")
+
+    pipeline = FaceHeatmapPipeline(args.video, args.output_dir, config, calibration=calibration)
     result = pipeline.run()
 
     print(f"Layout used: {result.layout_used.value}")

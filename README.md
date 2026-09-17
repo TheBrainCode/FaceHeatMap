@@ -46,6 +46,62 @@ and is not independently verified against ground-truth video in this
 project. If a heatmap looks mirrored for your footage, use `--flip-yaw`
 and/or `--flip-pitch` to correct it.
 
+You can substantially improve on this heuristic by recording a short
+per-setup **calibration** clip and fitting a real mapping instead — see
+below.
+
+## Calibration (recommended)
+
+Record both participants, in the same physical setup (same camera, same
+monitor size/distance, same seating) they'll use for the real call, looking
+at 9 known points on their own screen in this fixed order, holding each for
+**2 seconds**:
+
+```
+1. center        2. top-left     3. top          4. top-right
+5. right         6. bottom-right 7. bottom       8. bottom-left
+9. left
+```
+
+Both people look at their own corresponding point at the same time (e.g.
+one person reads the sequence out loud, or you use a shared 2-second
+timer/metronome) — a single ~18-second video covers both people's
+calibration in one pass. Move directly from point to point; you don't need
+to pause between them (the first/last fraction of each 2-second window is
+automatically trimmed to skip the eye movement between points).
+
+Fit the calibration:
+
+```bash
+faceheatmap-calibrate calibration_recording.mp4 -o calibration.json
+```
+
+Then use it for the real call recording:
+
+```bash
+faceheatmap real_call.mp4 -o output/ --calibration calibration.json
+```
+
+This replaces the generic assumed-FOV heuristic with a small linear
+regression, fit per person, from their actual observed head-pose/iris
+signal at each of the 9 known points to that point's real screen position.
+It's still not lab-grade eye tracking, but it corrects for individual
+differences (eye shape, camera offset, screen distance) that the generic
+heuristic can't account for, and it also fixes the yaw/pitch sign-direction
+guess automatically (no more `--flip-yaw` guessing).
+
+**Caveats:**
+- The calibration is tied to the *physical setup*, not just the person. If
+  either person's camera, monitor, or seating differs between the
+  calibration clip and the real call, accuracy degrades back toward the
+  generic heuristic.
+- If `--seconds-per-point` differed when you recorded (e.g. you used 3s
+  holds instead of 2s), pass the same value to `faceheatmap-calibrate`
+  with `--seconds-per-point`.
+- `--layout` should match between the calibration recording and the real
+  call (both default to `auto`, which works fine as long as the panel
+  arrangement is consistent).
+
 ## Assumptions
 
 - The recording shows a standard **two-person Zoom gallery layout**: each
@@ -135,10 +191,12 @@ python -m pytest -q
 
 Tests are split into:
 - Pure-logic unit tests (rotation math, layout splitting, tracker, gaze
-  math, face-boundary containment, heatmap accumulation) — no ML model
-  needed.
-- `tests/test_pipeline_integration.py` — exercises the full pipeline
-  end-to-end against a fake landmarker (deterministic, no model download).
+  math, face-boundary containment, heatmap accumulation, calibration
+  fitting) — no ML model needed.
+- `tests/test_pipeline_integration.py`, `tests/test_pipeline_calibration_integration.py`
+  — exercise the full pipeline end-to-end against a fake landmarker
+  (deterministic, no model download).
 - `tests/test_real_landmarker_smoke.py` — runs the real MediaPipe model
-  against a synthetic two-panel frame; skipped automatically if
-  `models/face_landmarker.task` hasn't been downloaded.
+  (including the calibration flow) against a synthetic two-panel frame;
+  skipped automatically if `models/face_landmarker.task` hasn't been
+  downloaded.

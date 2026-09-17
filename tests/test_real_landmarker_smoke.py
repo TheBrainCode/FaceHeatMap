@@ -8,7 +8,8 @@ import cv2
 import numpy as np
 import pytest
 
-from faceheatmap.config import PipelineConfig
+from faceheatmap.calibration import CALIBRATION_POINTS, CalibrationConfig, run_calibration
+from faceheatmap.config import LayoutMode, PersonId, PipelineConfig
 from faceheatmap.pipeline import FaceHeatmapPipeline
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "face_landmarker.task")
@@ -52,3 +53,28 @@ def test_real_model_detects_both_faces_and_produces_outputs(tmp_path):
         assert "full_frame" in paths
         img = cv2.imread(paths["full_frame"])
         assert img is not None and img.shape == (500, 800, 3)
+
+
+@requires_model
+def test_real_model_calibration_end_to_end(tmp_path):
+    from faceheatmap.landmarker import FaceLandmarkerWrapper
+
+    fps = 10.0
+    seconds_per_point = 1.0
+    num_frames = int(len(CALIBRATION_POINTS) * seconds_per_point * fps)
+
+    video_path = str(tmp_path / "calib.mp4")
+    _build_two_panel_video(video_path, num_frames=num_frames)
+
+    with FaceLandmarkerWrapper(model_path=MODEL_PATH, num_faces=2) as landmarker:
+        calibration = run_calibration(
+            video_path,
+            landmarker,
+            CalibrationConfig(seconds_per_point=seconds_per_point, trim_start_frac=0.2, trim_end_frac=0.1),
+            layout=LayoutMode.SIDE_BY_SIDE,
+        )
+
+    assert set(calibration.keys()) == {PersonId.PERSON_1, PersonId.PERSON_2}
+    for cal in calibration.values():
+        assert len(cal.h_weights) == 3
+        assert len(cal.v_weights) == 3
