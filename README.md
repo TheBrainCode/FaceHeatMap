@@ -126,6 +126,31 @@ guess automatically (no more `--flip-yaw` guessing).
 - Both faces are visible (unobstructed, reasonably front-facing) for at
   least one frame, to establish the layout.
 
+## Troubleshooting: "both faces detected in 0" / stuck at "Never detected two faces"
+
+The default detection mode asks MediaPipe to find both faces in one pass
+over the whole frame. In practice, if the two participants are at
+noticeably different distances from their own cameras (so their faces
+occupy very different amounts of the frame), MediaPipe can end up only
+ever returning the larger/closer face and never the other one — confirmed
+directly against real footage, not just a theoretical edge case, and it
+doesn't respond to lowering `--min-detection-confidence`-style thresholds.
+
+If you hit this, pass `--split-panel-detection` (with an explicit
+`--layout`, since panel boundaries have to be known up front rather than
+inferred from a whole-frame detection):
+
+```bash
+faceheatmap recording.mp4 -o output/ --layout side_by_side --split-panel-detection
+faceheatmap-calibrate calibration_recording.mp4 -o calibration.json --layout side_by_side --split-panel-detection
+```
+
+This detects each panel independently (one face per crop) instead of
+asking for two faces from the combined frame, which sidesteps the
+scale-mismatch limitation entirely. It also means panel-based identity is
+exact — no frame-to-frame tracking ambiguity — since which panel a
+detection came from *is* the person's identity.
+
 ## Setup
 
 Requires Python 3.9-3.12.

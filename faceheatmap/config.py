@@ -66,3 +66,10 @@ class PipelineConfig:
     heatmap: HeatmapConfig = field(default_factory=HeatmapConfig)
     write_debug_video: bool = False
     write_csv_log: bool = True
+    split_panel_detection: bool = False
+    """Detect each panel independently instead of running num_faces=2 on the
+    whole frame. Fixes cases where MediaPipe's detector only returns one
+    face on a combined frame with two very differently-scaled faces (e.g.
+    one participant much closer to their camera than the other). Requires
+    `layout` to be explicit (side_by_side/top_bottom), not auto.
+    """

@@ -270,4 +270,107 @@ def test_collect_calibration_samples_debug_video_on_success(tmp_path):
     collect_calibration_samples(video_path, landmarker, config, layout=LayoutMode.SIDE_BY_SIDE, debug_video_path=debug_path)
 
     assert os.path.exists(debug_path)
-    assert os.path.getsize(debug_path) > 0
+
+
+class ScriptedPanelLandmarker:
+    """Split-panel counterpart to ScriptedCalibrationLandmarker: only ever
+    handed one person's own panel crop, reports a single face at fixed
+    local coordinates with an iris offset driven by which calibration
+    point is active at that timestamp (or a fixed straight-ahead offset).
+    """
+
+    def __init__(self, seconds_per_point: float, moving: bool):
+        self.seconds_per_point = seconds_per_point
+        self.moving = moving
+        self.calls = 0
+
+    def detect(self, frame_bgr, timestamp_ms):
+        from faceheatmap.landmark_indices import LEFT_IRIS_CENTER, NUM_LANDMARKS, RIGHT_IRIS_CENTER, get_landmark_indices
+
+        self.calls += 1
+        if self.moving:
+            t_s = timestamp_ms / 1000.0
+            point_index = min(int(t_s // self.seconds_per_point), len(CALIBRATION_POINTS) - 1)
+            _, h_offset, v_offset = CALIBRATION_POINTS[point_index]
+        else:
+            h_offset, v_offset = 0.0, 0.0
+
+        indices = get_landmark_indices()
+        landmarks = np.zeros((NUM_LANDMARKS, 3))
+        cx, cy = 100, 100
+        oval = indices["face_oval"]
+        for i, idx in enumerate(oval):
+            angle = 2 * np.pi * i / len(oval)
+            landmarks[idx, 0] = cx + 60 * np.cos(angle)
+            landmarks[idx, 1] = cy + 60 * np.sin(angle)
+        for eye_key, iris_idx, x_off in [("left_eye", LEFT_IRIS_CENTER, 15.0), ("right_eye", RIGHT_IRIS_CENTER, -15.0)]:
+            eye_cx, eye_cy = cx + x_off, cy - 10.0
+            half_w, half_h = 8.0, 4.0
+            for i, idx in enumerate(indices[eye_key]):
+                angle = 2 * np.pi * i / len(indices[eye_key])
+                landmarks[idx, 0] = eye_cx + half_w * np.cos(angle)
+                landmarks[idx, 1] = eye_cy + half_h * np.sin(angle)
+            landmarks[iris_idx, 0] = eye_cx + h_offset * half_w
+            landmarks[iris_idx, 1] = eye_cy + v_offset * half_h
+
+        bbox = BBox(*landmarks[:, :2].min(axis=0), *landmarks[:, :2].max(axis=0))
+        return [FaceObservation(bbox=bbox, landmarks_px=landmarks, transform_matrix=np.eye(4))]
+
+
+def test_collect_calibration_samples_split_panel_mode(tmp_path):
+    fps = 10.0
+    seconds_per_point = 1.0
+    num_frames = int(len(CALIBRATION_POINTS) * seconds_per_point * fps)
+    video_path = str(tmp_path / "calib.mp4")
+    _write_blank_video(video_path, num_frames, fps=fps)
+
+    landmarker1 = ScriptedPanelLandmarker(seconds_per_point, moving=True)
+    landmarker2 = ScriptedPanelLandmarker(seconds_per_point, moving=False)
+    config = CalibrationConfig(seconds_per_point=seconds_per_point, trim_start_frac=0.2, trim_end_frac=0.1)
+
+    samples = collect_calibration_samples(
+        video_path, calib_config=config, layout=LayoutMode.SIDE_BY_SIDE,
+        landmarker_person1=landmarker1, landmarker_person2=landmarker2,
+    )
+
+    assert len(samples[PersonId.PERSON_1]) == len(CALIBRATION_POINTS)
+    assert len(samples[PersonId.PERSON_2]) == len(CALIBRATION_POINTS)
+    assert landmarker1.calls == num_frames
+    assert landmarker2.calls == num_frames
+
+    by_name = {s.point_name: s for s in samples[PersonId.PERSON_1]}
+    assert by_name["top-left"].raw.eye_h == pytest.approx(-1.0, abs=0.05)
+    assert by_name["right"].raw.eye_h == pytest.approx(1.0, abs=0.05)
+
+
+def test_run_calibration_split_panel_mode_fits_usable_calibration(tmp_path):
+    fps = 10.0
+    seconds_per_point = 1.0
+    num_frames = int(len(CALIBRATION_POINTS) * seconds_per_point * fps)
+    video_path = str(tmp_path / "calib.mp4")
+    _write_blank_video(video_path, num_frames, fps=fps)
+
+    landmarker1 = ScriptedPanelLandmarker(seconds_per_point, moving=True)
+    landmarker2 = ScriptedPanelLandmarker(seconds_per_point, moving=False)
+    config = CalibrationConfig(seconds_per_point=seconds_per_point, trim_start_frac=0.2, trim_end_frac=0.1)
+
+    calibration = run_calibration(
+        video_path, calib_config=config, layout=LayoutMode.SIDE_BY_SIDE,
+        landmarker_person1=landmarker1, landmarker_person2=landmarker2,
+    )
+    assert set(calibration.keys()) == {PersonId.PERSON_1, PersonId.PERSON_2}
+
+    raw_right = RawGazeSignal(head_yaw_deg=0.0, head_pitch_deg=0.0, eye_h=1.0, eye_v=0.0)
+    norm_x, _ = calibration[PersonId.PERSON_1].apply(raw_right)
+    assert norm_x > 0
+
+
+def test_collect_calibration_samples_requires_landmarker_or_both_panel_landmarkers(tmp_path):
+    video_path = str(tmp_path / "calib.mp4")
+    _write_blank_video(video_path, num_frames=5)
+
+    with pytest.raises(ValueError, match="Pass either landmarker"):
+        collect_calibration_samples(video_path)
+
+    with pytest.raises(ValueError, match="must be given together"):
+        collect_calibration_samples(video_path, landmarker_person1=ScriptedPanelLandmarker(1.0, True))

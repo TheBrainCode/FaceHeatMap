@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from faceheatmap.config import LayoutMode, PersonId
-from faceheatmap.detection_loop import TwoPersonDetectionLoop
+from faceheatmap.detection_loop import SplitPanelDetectionLoop, TwoPersonDetectionLoop, _offset_observation
 from faceheatmap.landmarker import FaceObservation
 from faceheatmap.layout import BBox
 
@@ -103,3 +103,105 @@ def test_identity_persists_across_frames_via_tracker(tmp_path):
     detected = list(loop)
     assert detected[0].person_obs[PersonId.PERSON_1].bbox.x0 == pytest.approx(170)
     assert detected[1].person_obs[PersonId.PERSON_1].bbox.x0 == pytest.approx(170)
+
+
+# --- SplitPanelDetectionLoop ---
+
+
+def test_offset_observation_shifts_bbox_and_landmarks():
+    landmarks = np.zeros((478, 3))
+    landmarks[0] = [5.0, 10.0, 1.0]
+    obs = FaceObservation(bbox=BBox(0, 0, 20, 30), landmarks_px=landmarks, transform_matrix=np.eye(4) * 2)
+
+    shifted = _offset_observation(obs, dx=100, dy=50)
+
+    assert shifted.bbox == BBox(100, 50, 120, 80)
+    assert shifted.landmarks_px[0].tolist() == [105.0, 60.0, 1.0]
+    assert np.array_equal(shifted.transform_matrix, obs.transform_matrix)  # unaffected
+    # Original observation must not be mutated.
+    assert obs.landmarks_px[0].tolist() == [5.0, 10.0, 1.0]
+
+
+def test_split_panel_loop_rejects_auto_layout(tmp_path):
+    video_path = str(tmp_path / "v.mp4")
+    _write_blank_video(video_path, num_frames=1)
+    with pytest.raises(ValueError, match="explicit layout"):
+        SplitPanelDetectionLoop(video_path, ScriptedLandmarker([]), ScriptedLandmarker([]), layout=LayoutMode.AUTO)
+
+
+def test_split_panel_loop_establishes_panels_immediately(tmp_path):
+    video_path = str(tmp_path / "v.mp4")
+    _write_blank_video(video_path, num_frames=1)
+    loop = SplitPanelDetectionLoop(video_path, ScriptedLandmarker([[]]), ScriptedLandmarker([[]]), layout=LayoutMode.SIDE_BY_SIDE)
+    assert loop.layout_used is LayoutMode.SIDE_BY_SIDE
+    assert loop.panels[PersonId.PERSON_1] == BBox(0, 0, FRAME_W / 2, FRAME_H)
+    assert loop.panels[PersonId.PERSON_2] == BBox(FRAME_W / 2, 0, FRAME_W, FRAME_H)
+
+
+def test_split_panel_loop_offsets_detections_into_full_frame_coords(tmp_path):
+    video_path = str(tmp_path / "v.mp4")
+    _write_blank_video(video_path, num_frames=1)
+
+    # Each landmarker sees only its own panel crop, so it reports a
+    # panel-local bbox (e.g. near the crop's own origin).
+    local_obs = _obs(50, 50)
+    landmarker1 = ScriptedLandmarker([[local_obs]])
+    landmarker2 = ScriptedLandmarker([[local_obs]])
+
+    loop = SplitPanelDetectionLoop(video_path, landmarker1, landmarker2, layout=LayoutMode.SIDE_BY_SIDE)
+    detected = list(loop)
+    assert len(detected) == 1
+
+    p1_bbox = detected[0].person_obs[PersonId.PERSON_1].bbox
+    p2_bbox = detected[0].person_obs[PersonId.PERSON_2].bbox
+    # Person 1's panel starts at x=0, so local and full-frame coords match.
+    assert p1_bbox == local_obs.bbox
+    # Person 2's panel starts at x=FRAME_W/2, so that offset must be added.
+    assert p2_bbox.x0 == pytest.approx(local_obs.bbox.x0 + FRAME_W / 2)
+    assert p2_bbox.y0 == pytest.approx(local_obs.bbox.y0)
+
+
+def test_split_panel_loop_handles_one_panel_missing_a_detection(tmp_path):
+    video_path = str(tmp_path / "v.mp4")
+    _write_blank_video(video_path, num_frames=1)
+
+    landmarker1 = ScriptedLandmarker([[_obs(50, 50)]])
+    landmarker2 = ScriptedLandmarker([[]])  # no face found this frame
+
+    loop = SplitPanelDetectionLoop(video_path, landmarker1, landmarker2, layout=LayoutMode.SIDE_BY_SIDE)
+    detected = list(loop)
+    assert set(detected[0].person_obs.keys()) == {PersonId.PERSON_1}
+
+
+def test_split_panel_loop_no_identity_ambiguity_by_construction(tmp_path):
+    # Each landmarker is permanently bound to its own panel, so there's
+    # nothing to track/swap -- unlike TwoPersonDetectionLoop's IoU tracker.
+    video_path = str(tmp_path / "v.mp4")
+    _write_blank_video(video_path, num_frames=2)
+
+    landmarker1 = ScriptedLandmarker([[_obs(50, 50)], [_obs(55, 52)]])
+    landmarker2 = ScriptedLandmarker([[_obs(45, 48)], [_obs(48, 50)]])
+
+    loop = SplitPanelDetectionLoop(video_path, landmarker1, landmarker2, layout=LayoutMode.SIDE_BY_SIDE)
+    detected = list(loop)
+    for d in detected:
+        assert PersonId.PERSON_1 in d.person_obs
+        assert PersonId.PERSON_2 in d.person_obs
+
+
+def test_split_panel_loop_respects_frame_stride_and_max_frames(tmp_path):
+    video_path = str(tmp_path / "v.mp4")
+    _write_blank_video(video_path, num_frames=20)
+    obs_list = [[_obs(50, 50)] for _ in range(20)]
+    landmarker1 = ScriptedLandmarker(obs_list)
+    landmarker2 = ScriptedLandmarker(obs_list)
+
+    loop = SplitPanelDetectionLoop(video_path, landmarker1, landmarker2, layout=LayoutMode.SIDE_BY_SIDE, frame_stride=2, max_frames=4)
+    detected = list(loop)
+    assert len(detected) == 4
+    assert [d.frame_index for d in detected] == [0, 2, 4, 6]
+
+
+def test_split_panel_loop_missing_video_raises_immediately(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        SplitPanelDetectionLoop(str(tmp_path / "nope.mp4"), ScriptedLandmarker([]), ScriptedLandmarker([]), layout=LayoutMode.SIDE_BY_SIDE)

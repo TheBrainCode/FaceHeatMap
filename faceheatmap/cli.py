@@ -44,6 +44,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-csv", action="store_true", help="Skip writing the per-frame gaze_log.csv")
 
     parser.add_argument(
+        "--split-panel-detection",
+        action="store_true",
+        help=(
+            "Detect each panel independently instead of running two-face detection on the "
+            "whole frame. Use this if faces_with_both_faces stays near 0 despite both people "
+            "clearly being visible -- common when they're at noticeably different distances "
+            "from their cameras, which can make MediaPipe only ever return one of the two "
+            "faces from a combined-frame detection pass. Requires an explicit --layout, not auto."
+        ),
+    )
+
+    parser.add_argument(
         "--calibration",
         default=None,
         help="Path to a calibration.json from faceheatmap-calibrate; replaces the FOV heuristic with a fitted per-person mapping",
@@ -74,12 +86,17 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         ),
         write_debug_video=args.debug_video,
         write_csv_log=not args.no_csv,
+        split_panel_detection=args.split_panel_detection,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    if args.split_panel_detection and args.layout == LayoutMode.AUTO.value:
+        parser.error("--split-panel-detection requires an explicit --layout (side_by_side or top_bottom), not auto.")
+
     config = config_from_args(args)
 
     calibration = None

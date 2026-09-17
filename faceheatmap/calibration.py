@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 
 from faceheatmap.config import LayoutMode, PersonId
-from faceheatmap.detection_loop import Landmarker, TwoPersonDetectionLoop
+from faceheatmap.detection_loop import Landmarker, SplitPanelDetectionLoop, TwoPersonDetectionLoop
 from faceheatmap.gaze import RawGazeSignal, compute_raw_signal
 
 # (name, target_x, target_y), normalized screen coords in [-1, 1] x [-1, 1].
@@ -110,11 +110,13 @@ def fit_person_calibration(samples: list[CalibrationSample]) -> PersonCalibratio
 
 def collect_calibration_samples(
     video_path: str,
-    landmarker: Landmarker,
+    landmarker: Landmarker | None = None,
     calib_config: CalibrationConfig | None = None,
     layout: LayoutMode = LayoutMode.AUTO,
     frame_stride: int = 1,
     debug_video_path: str | None = None,
+    landmarker_person1: Landmarker | None = None,
+    landmarker_person2: Landmarker | None = None,
 ) -> dict[PersonId, list[CalibrationSample]]:
     """Runs the calibration video through detection/tracking and buckets each
     frame's raw signal into the calibration point active at that timestamp.
@@ -122,9 +124,22 @@ def collect_calibration_samples(
     Raises immediately if the two faces are never detected together at all
     (most common cause of an empty result), rather than silently returning
     nothing and leaving the caller to guess why.
+
+    Pass either `landmarker` (whole-frame num_faces=2 detection, works with
+    `layout=auto`) or both `landmarker_person1`/`landmarker_person2`
+    (independent per-panel single-face detection, requires an explicit
+    layout -- see `SplitPanelDetectionLoop`, and use this when the two
+    faces differ a lot in scale within the frame).
     """
     calib_config = calib_config or CalibrationConfig()
-    loop = TwoPersonDetectionLoop(video_path, landmarker, layout=layout, frame_stride=frame_stride)
+    if landmarker_person1 is not None or landmarker_person2 is not None:
+        if landmarker_person1 is None or landmarker_person2 is None:
+            raise ValueError("Both landmarker_person1 and landmarker_person2 must be given together for split-panel detection.")
+        loop = SplitPanelDetectionLoop(video_path, landmarker_person1, landmarker_person2, layout=layout, frame_stride=frame_stride)
+    else:
+        if landmarker is None:
+            raise ValueError("Pass either landmarker, or both landmarker_person1 and landmarker_person2.")
+        loop = TwoPersonDetectionLoop(video_path, landmarker, layout=layout, frame_stride=frame_stride)
 
     # Pre-populated so a point that's never reached (e.g. a too-short
     # recording) is distinguishable from one that just had 0 counted frames.
@@ -192,13 +207,18 @@ def collect_calibration_samples(
 
 def run_calibration(
     video_path: str,
-    landmarker: Landmarker,
+    landmarker: Landmarker | None = None,
     calib_config: CalibrationConfig | None = None,
     layout: LayoutMode = LayoutMode.AUTO,
     frame_stride: int = 1,
     debug_video_path: str | None = None,
+    landmarker_person1: Landmarker | None = None,
+    landmarker_person2: Landmarker | None = None,
 ) -> dict[PersonId, PersonCalibration]:
-    samples = collect_calibration_samples(video_path, landmarker, calib_config, layout, frame_stride, debug_video_path)
+    samples = collect_calibration_samples(
+        video_path, landmarker, calib_config, layout, frame_stride, debug_video_path,
+        landmarker_person1=landmarker_person1, landmarker_person2=landmarker_person2,
+    )
 
     result: dict[PersonId, PersonCalibration] = {}
     for person, person_samples in samples.items():
@@ -241,6 +261,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seconds-per-point", type=float, default=2.0, help="How long each point was held for while recording")
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument(
+        "--split-panel-detection",
+        action="store_true",
+        help=(
+            "Detect each panel independently instead of running two-face detection on the "
+            "whole frame. Use this if the whole-frame mode only ever finds one of the two "
+            "people (common when they're at noticeably different distances from their "
+            "cameras). Requires an explicit --layout, not auto."
+        ),
+    )
+    parser.add_argument(
         "--debug-video",
         nargs="?",
         const="calibration_debug.mp4",
@@ -250,24 +280,44 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.split_panel_detection and args.layout == LayoutMode.AUTO.value:
+        parser.error("--split-panel-detection requires an explicit --layout (side_by_side or top_bottom), not auto.")
+
     from faceheatmap.landmarker import FaceLandmarkerWrapper
 
-    landmarker = FaceLandmarkerWrapper(model_path=args.model_path, num_faces=2)
+    landmarkers: list[FaceLandmarkerWrapper] = []
     try:
-        calibration = run_calibration(
-            args.video,
-            landmarker,
-            CalibrationConfig(seconds_per_point=args.seconds_per_point),
-            layout=LayoutMode(args.layout),
-            frame_stride=args.frame_stride,
-            debug_video_path=args.debug_video,
-        )
+        if args.split_panel_detection:
+            landmarker1 = FaceLandmarkerWrapper(model_path=args.model_path, num_faces=1)
+            landmarker2 = FaceLandmarkerWrapper(model_path=args.model_path, num_faces=1)
+            landmarkers = [landmarker1, landmarker2]
+            calibration = run_calibration(
+                args.video,
+                calib_config=CalibrationConfig(seconds_per_point=args.seconds_per_point),
+                layout=LayoutMode(args.layout),
+                frame_stride=args.frame_stride,
+                debug_video_path=args.debug_video,
+                landmarker_person1=landmarker1,
+                landmarker_person2=landmarker2,
+            )
+        else:
+            landmarker = FaceLandmarkerWrapper(model_path=args.model_path, num_faces=2)
+            landmarkers = [landmarker]
+            calibration = run_calibration(
+                args.video,
+                landmarker,
+                CalibrationConfig(seconds_per_point=args.seconds_per_point),
+                layout=LayoutMode(args.layout),
+                frame_stride=args.frame_stride,
+                debug_video_path=args.debug_video,
+            )
     except RuntimeError:
         if args.debug_video:
             print(f"Calibration failed -- see {args.debug_video} for what was detected frame by frame.", file=sys.stderr)
         raise
     finally:
-        landmarker.close()
+        for lm in landmarkers:
+            lm.close()
 
     save_calibration(calibration, args.output)
     print(f"Calibration written to {args.output}")

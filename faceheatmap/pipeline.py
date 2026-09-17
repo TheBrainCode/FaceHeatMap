@@ -11,7 +11,7 @@ import numpy as np
 
 from faceheatmap.config import PersonId, PipelineConfig, LayoutMode
 from faceheatmap.debug_draw import draw_debug_overlay
-from faceheatmap.detection_loop import Landmarker, TwoPersonDetectionLoop
+from faceheatmap.detection_loop import Landmarker, SplitPanelDetectionLoop, TwoPersonDetectionLoop
 from faceheatmap.face_boundary import BoundaryStats, build_face_polygon, point_in_polygon
 from faceheatmap.gaze import GazeCalibration, GazeResult, SmoothedGazeEstimator
 from faceheatmap.heatmap import HeatmapAccumulator, overlay_on_image
@@ -30,12 +30,12 @@ class PipelineResult:
     csv_path: str | None = None
 
 
-def _make_landmarker(config: PipelineConfig) -> Landmarker:
+def _make_landmarker(config: PipelineConfig, num_faces: int | None = None) -> Landmarker:
     from faceheatmap.landmarker import FaceLandmarkerWrapper
 
     return FaceLandmarkerWrapper(
         model_path=config.model_path,
-        num_faces=config.num_faces,
+        num_faces=num_faces if num_faces is not None else config.num_faces,
         min_detection_confidence=config.min_detection_confidence,
         min_presence_confidence=config.min_presence_confidence,
         min_tracking_confidence=config.min_tracking_confidence,
@@ -49,12 +49,16 @@ class FaceHeatmapPipeline:
         output_dir: str,
         config: PipelineConfig | None = None,
         landmarker: Landmarker | None = None,
+        landmarker_person1: Landmarker | None = None,
+        landmarker_person2: Landmarker | None = None,
         calibration: dict[PersonId, GazeCalibration] | None = None,
     ):
         self.video_path = video_path
         self.output_dir = output_dir
         self.config = config or PipelineConfig()
         self._external_landmarker = landmarker
+        self._external_landmarker_person1 = landmarker_person1
+        self._external_landmarker_person2 = landmarker_person2
         self._calibration = calibration or {}
         self._panels: dict[PersonId, BBox] | None = None
         self._layout_used = self.config.layout
@@ -65,16 +69,37 @@ class FaceHeatmapPipeline:
         if not cv2.VideoCapture(self.video_path).isOpened():
             raise FileNotFoundError(f"Could not open video: {self.video_path}")
 
-        landmarker = self._external_landmarker or _make_landmarker(self.config)
-        owns_landmarker = self._external_landmarker is None
+        owned_landmarkers: list[Landmarker] = []
 
-        loop = TwoPersonDetectionLoop(
-            self.video_path,
-            landmarker,
-            layout=self.config.layout,
-            frame_stride=self.config.frame_stride,
-            max_frames=self.config.max_frames,
-        )
+        if self.config.split_panel_detection:
+            if self.config.layout is LayoutMode.AUTO:
+                raise ValueError(
+                    "split_panel_detection requires an explicit --layout (side_by_side or "
+                    "top_bottom), since panel boundaries must be known before any detection "
+                    "can happen -- it can't be auto-detected the way the whole-frame mode can."
+                )
+            landmarker1 = self._external_landmarker_person1 or _make_landmarker(self.config, num_faces=1)
+            landmarker2 = self._external_landmarker_person2 or _make_landmarker(self.config, num_faces=1)
+            owned_landmarkers = [lm for lm, external in [(landmarker1, self._external_landmarker_person1), (landmarker2, self._external_landmarker_person2)] if external is None]
+            loop = SplitPanelDetectionLoop(
+                self.video_path,
+                landmarker1,
+                landmarker2,
+                layout=self.config.layout,
+                frame_stride=self.config.frame_stride,
+                max_frames=self.config.max_frames,
+            )
+        else:
+            landmarker = self._external_landmarker or _make_landmarker(self.config)
+            if self._external_landmarker is None:
+                owned_landmarkers = [landmarker]
+            loop = TwoPersonDetectionLoop(
+                self.video_path,
+                landmarker,
+                layout=self.config.layout,
+                frame_stride=self.config.frame_stride,
+                max_frames=self.config.max_frames,
+            )
         frame_w, frame_h = loop.frame_w, loop.frame_h
 
         gaze_estimators = {
@@ -147,8 +172,9 @@ class FaceHeatmapPipeline:
         finally:
             if debug_writer is not None:
                 debug_writer.release()
-            if owns_landmarker and hasattr(landmarker, "close"):
-                landmarker.close()
+            for lm in owned_landmarkers:
+                if hasattr(lm, "close"):
+                    lm.close()
 
         self._panels = loop.panels
         self._layout_used = loop.layout_used or self.config.layout
