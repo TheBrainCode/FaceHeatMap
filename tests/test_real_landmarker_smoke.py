@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from faceheatmap.calibration import CALIBRATION_POINTS, CalibrationConfig, run_calibration
+from faceheatmap.cli import main as cli_main
 from faceheatmap.config import LayoutMode, PersonId, PipelineConfig
 from faceheatmap.pipeline import FaceHeatmapPipeline
 
@@ -78,3 +79,30 @@ def test_real_model_calibration_end_to_end(tmp_path):
     for cal in calibration.values():
         assert len(cal.h_weights) == 3
         assert len(cal.v_weights) == 3
+
+
+@requires_model
+def test_cli_reports_debug_video_path_when_requested(tmp_path, capsys):
+    video_path = str(tmp_path / "two_panel.mp4")
+    _build_two_panel_video(video_path)
+    out_dir = str(tmp_path / "out")
+
+    exit_code = cli_main([video_path, "-o", out_dir, "--model-path", MODEL_PATH, "--debug-video"])
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    debug_path = os.path.join(out_dir, "debug_annotated.mp4")
+    assert f"Debug video: {debug_path}" in captured.out
+    assert os.path.exists(debug_path)
+
+
+@requires_model
+def test_cli_omits_debug_video_line_when_not_requested(tmp_path, capsys):
+    video_path = str(tmp_path / "two_panel.mp4")
+    _build_two_panel_video(video_path)
+    out_dir = str(tmp_path / "out")
+
+    cli_main([video_path, "-o", out_dir, "--model-path", MODEL_PATH])
+
+    captured = capsys.readouterr()
+    assert "Debug video:" not in captured.out

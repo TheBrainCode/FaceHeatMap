@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from faceheatmap.config import GazeConfig, HeatmapConfig, LayoutMode, PipelineConfig
@@ -119,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {person} [{kind}]: {path}")
     if result.csv_path:
         print(f"Per-frame log: {result.csv_path}")
+    if config.write_debug_video:
+        print(f"Debug video: {os.path.join(args.output_dir, 'debug_annotated.mp4')}")
     return 0
 
 
